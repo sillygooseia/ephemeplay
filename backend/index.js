@@ -26,6 +26,9 @@ const tokenGen = customAlphabet("abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWX
 const PORT = Number(process.env.PORT || 8787);
 const ROOM_TTL_MS = Number(process.env.ROOM_TTL_MS || 1000 * 60 * 60 * 2);
 const CLEANUP_EVERY_MS = 30_000;
+const LOBBY_STALE_MS = Number(process.env.LOBBY_STALE_MS || 45_000);
+const PROPOSAL_TTL_MS = Number(process.env.PROPOSAL_TTL_MS || 30_000);
+const PROPOSAL_COOLDOWN_MS = Number(process.env.PROPOSAL_COOLDOWN_MS || 4_000);
 
 // ── Redis (optional — all rate limiting and metrics degrade gracefully without it) ──
 let redis = null;
@@ -60,6 +63,18 @@ const playerRegistry = PLAYER_JWT_SECRET
   : null;
 
 const rooms = new Map();
+const lobbyPlayers = new Map(); // memberId -> { memberId, displayName, socketId, signal, lastSeenAt }
+const proposals = new Map(); // proposalId -> { id, fromMemberId, toMemberId, createdAt, expiresAt }
+const lastProposalAt = new Map(); // memberId -> timestamp
+
+const LOBBY_SIGNALS = new Set([
+  "ready",
+  "quick",
+  "casual",
+  "1min",
+  "brb",
+  "pass"
+]);
 
 function createDeck(roomId, deckCount = 1) {
   const suits = ["spades", "hearts", "diamonds", "clubs"];
@@ -139,6 +154,96 @@ function roomChannel(roomId) {
   return `room:${roomId}`;
 }
 
+function lobbyChannel() {
+  return "lobby:global";
+}
+
+function serializeLobbyPlayer(player) {
+  return {
+    memberId: player.memberId,
+    displayName: player.displayName || "Player",
+    signal: player.signal || null,
+    lastSeenAt: player.lastSeenAt
+  };
+}
+
+function proposalsForMember(memberId) {
+  return Array.from(proposals.values())
+    .filter((p) => p.fromMemberId === memberId || p.toMemberId === memberId)
+    .map((p) => ({
+      proposalId: p.id,
+      fromMemberId: p.fromMemberId,
+      toMemberId: p.toMemberId,
+      expiresAt: p.expiresAt
+    }));
+}
+
+function broadcastLobbySnapshot() {
+  const players = Array.from(lobbyPlayers.values())
+    .sort((a, b) => (a.displayName || "").localeCompare(b.displayName || ""))
+    .map(serializeLobbyPlayer);
+
+  for (const player of lobbyPlayers.values()) {
+    if (!player.socketId) { continue; }
+    io.to(player.socketId).emit("lobby:snapshot", {
+      players,
+      proposals: proposalsForMember(player.memberId)
+    });
+  }
+}
+
+function removeLobbyMember(memberId, reason = "left") {
+  const existing = lobbyPlayers.get(memberId);
+  if (!existing) { return; }
+
+  lobbyPlayers.delete(memberId);
+  lastProposalAt.delete(memberId);
+
+  for (const [proposalId, proposal] of proposals.entries()) {
+    if (proposal.fromMemberId === memberId || proposal.toMemberId === memberId) {
+      const otherId = proposal.fromMemberId === memberId ? proposal.toMemberId : proposal.fromMemberId;
+      const other = lobbyPlayers.get(otherId);
+      if (other?.socketId) {
+        io.to(other.socketId).emit("lobby:proposal:closed", {
+          proposalId,
+          reason
+        });
+      }
+      proposals.delete(proposalId);
+    }
+  }
+
+  io.to(lobbyChannel()).emit("lobby:presence", { members: lobbyPlayers.size });
+  broadcastLobbySnapshot();
+}
+
+function createRoomWithDeck(deckCount = 1) {
+  const safeDeckCount = Math.max(1, Math.min(6, Number(deckCount) || 1));
+  const roomId = roomIdGen();
+  const inviteToken = tokenGen();
+  const createdAt = now();
+
+  const room = {
+    roomId,
+    inviteToken,
+    createdAt,
+    lastActiveAt: createdAt,
+    expiresAt: createdAt + ROOM_TTL_MS,
+    revision: 1,
+    cards: createDeck(roomId, safeDeckCount),
+    dealCursor: 0,
+    pileX: 50,
+    pileY: 50,
+    activeTurn: null,
+    memberNames: new Map(),
+    members: new Set(),
+    memberSockets: new Map()
+  };
+
+  rooms.set(roomId, room);
+  return room;
+}
+
 function pruneExpiredRooms() {
   const ts = now();
   for (const [roomId, room] of rooms.entries()) {
@@ -151,6 +256,34 @@ function pruneExpiredRooms() {
 }
 
 setInterval(pruneExpiredRooms, CLEANUP_EVERY_MS);
+
+function pruneLobbyState() {
+  const ts = now();
+
+  for (const [memberId, player] of lobbyPlayers.entries()) {
+    if (ts - player.lastSeenAt > LOBBY_STALE_MS) {
+      removeLobbyMember(memberId, "stale");
+    }
+  }
+
+  for (const [proposalId, proposal] of proposals.entries()) {
+    if (proposal.expiresAt <= ts) {
+      const from = lobbyPlayers.get(proposal.fromMemberId);
+      const to = lobbyPlayers.get(proposal.toMemberId);
+      if (from?.socketId) {
+        io.to(from.socketId).emit("lobby:proposal:closed", { proposalId, reason: "expired" });
+      }
+      if (to?.socketId) {
+        io.to(to.socketId).emit("lobby:proposal:closed", { proposalId, reason: "expired" });
+      }
+      proposals.delete(proposalId);
+    }
+  }
+
+  broadcastLobbySnapshot();
+}
+
+setInterval(pruneLobbyState, 5_000);
 
 app.get("/healthz", (_req, res) => res.sendStatus(200));
 app.get("/api/health", (_req, res) => {
@@ -189,36 +322,14 @@ app.post("/api/identity", (req, res) => {
 });
 
 app.post("/api/rooms", createRoomLimiter, (req, res) => {
-  const deckCount   = Math.max(1, Math.min(6, Number((req.body || {}).deckCount) || 1));
-  const roomId      = roomIdGen();
-  const inviteToken = tokenGen();
-  const createdAt   = now();
-
-  const room = {
-    roomId,
-    inviteToken,
-    createdAt,
-    lastActiveAt: createdAt,
-    expiresAt: createdAt + ROOM_TTL_MS,
-    revision: 1,
-    cards: createDeck(roomId, deckCount),
-    dealCursor: 0,
-    pileX: 50,          // % — pile centre, updated by pile:move
-    pileY: 50,
-    activeTurn: null,   // memberId whose turn it is, or null
-    memberNames: new Map(), // memberId → display name (no turn tracking)
-    members: new Set(),
-    memberSockets: new Map()
-  };
-
-  rooms.set(roomId, room);
+  const room = createRoomWithDeck((req.body || {}).deckCount);
 
   recordHit();
   res.status(201).json({
-    roomId,
-    inviteToken,
+    roomId: room.roomId,
+    inviteToken: room.inviteToken,
     expiresAt: room.expiresAt,
-    joinPath: `/?room=${encodeURIComponent(roomId)}&token=${encodeURIComponent(inviteToken)}`
+    joinPath: `/?room=${encodeURIComponent(room.roomId)}&token=${encodeURIComponent(room.inviteToken)}`
   });
 });
 
@@ -239,14 +350,17 @@ app.post("/api/rooms/:roomId/join", joinRoomLimiter, joinPenalty, (req, res) => 
 app.use(express.static(path.join(__dirname, "public")));
 
 io.use((socket, next) => {
-  const { roomId, token, memberId, playerToken, displayName } = socket.handshake.auth || {};
-  const room = getRoom(roomId);
+  const { mode, roomId, token, memberId, playerToken, displayName } = socket.handshake.auth || {};
+  const socketMode = mode === "lobby" ? "lobby" : "room";
+  socket.data.mode = socketMode;
 
-  if (!assertRoomToken(room, token)) {
-    return next(new Error("invalid_invite"));
+  if (socketMode === "room") {
+    const room = getRoom(roomId);
+    if (!assertRoomToken(room, token)) {
+      return next(new Error("invalid_invite"));
+    }
+    socket.data.roomId = roomId;
   }
-
-  socket.data.roomId = roomId;
 
   // If a player JWT is present and a secret is configured, use the stable ID from it.
   // Otherwise fall back to the supplied memberId (anonymous / legacy).
@@ -269,6 +383,145 @@ io.use((socket, next) => {
 });
 
 io.on("connection", (socket) => {
+  if (socket.data.mode === "lobby") {
+    const memberId = socket.data.memberId;
+    const existing = lobbyPlayers.get(memberId);
+    const player = {
+      memberId,
+      displayName: socket.data.displayName || existing?.displayName || "Player",
+      socketId: socket.id,
+      signal: existing?.signal || "ready",
+      lastSeenAt: now()
+    };
+    lobbyPlayers.set(memberId, player);
+    socket.join(lobbyChannel());
+    io.to(lobbyChannel()).emit("lobby:presence", { members: lobbyPlayers.size });
+    broadcastLobbySnapshot();
+
+    socket.on("lobby:heartbeat", () => {
+      const active = lobbyPlayers.get(memberId);
+      if (!active) { return; }
+      active.lastSeenAt = now();
+    });
+
+    socket.on("lobby:signal", ({ signal }) => {
+      if (!LOBBY_SIGNALS.has(signal)) {
+        socket.emit("lobby:error", { code: "invalid_signal" });
+        return;
+      }
+      const active = lobbyPlayers.get(memberId);
+      if (!active) { return; }
+      active.signal = signal;
+      active.lastSeenAt = now();
+      broadcastLobbySnapshot();
+    });
+
+    socket.on("lobby:propose", ({ targetMemberId, deckCount = 1 }) => {
+      const from = lobbyPlayers.get(memberId);
+      const to = lobbyPlayers.get(targetMemberId);
+      if (!from || !to || targetMemberId === memberId) {
+        socket.emit("lobby:error", { code: "invalid_target" });
+        return;
+      }
+
+      const ts = now();
+      if (ts - (lastProposalAt.get(memberId) || 0) < PROPOSAL_COOLDOWN_MS) {
+        socket.emit("lobby:error", { code: "proposal_rate_limited" });
+        return;
+      }
+
+      const busy = Array.from(proposals.values()).some(
+        (p) => p.fromMemberId === memberId || p.toMemberId === memberId ||
+               p.fromMemberId === targetMemberId || p.toMemberId === targetMemberId
+      );
+      if (busy) {
+        socket.emit("lobby:error", { code: "player_busy" });
+        return;
+      }
+
+      const proposalId = `m-${tokenGen()}`;
+      const proposal = {
+        id: proposalId,
+        fromMemberId: memberId,
+        toMemberId: targetMemberId,
+        deckCount: Math.max(1, Math.min(6, Number(deckCount) || 1)),
+        createdAt: ts,
+        expiresAt: ts + PROPOSAL_TTL_MS
+      };
+      proposals.set(proposalId, proposal);
+      lastProposalAt.set(memberId, ts);
+
+      io.to(from.socketId).emit("lobby:proposal:outgoing", {
+        proposalId,
+        toMemberId: targetMemberId,
+        expiresAt: proposal.expiresAt
+      });
+      io.to(to.socketId).emit("lobby:proposal:incoming", {
+        proposalId,
+        fromMemberId: memberId,
+        deckCount: proposal.deckCount,
+        expiresAt: proposal.expiresAt
+      });
+      broadcastLobbySnapshot();
+    });
+
+    socket.on("lobby:proposal:respond", ({ proposalId, accept }) => {
+      const proposal = proposals.get(proposalId);
+      if (!proposal) {
+        socket.emit("lobby:error", { code: "proposal_missing" });
+        return;
+      }
+      if (proposal.toMemberId !== memberId) {
+        socket.emit("lobby:error", { code: "proposal_forbidden" });
+        return;
+      }
+
+      const from = lobbyPlayers.get(proposal.fromMemberId);
+      const to = lobbyPlayers.get(proposal.toMemberId);
+      if (!from || !to) {
+        proposals.delete(proposalId);
+        socket.emit("lobby:error", { code: "proposal_stale" });
+        broadcastLobbySnapshot();
+        return;
+      }
+
+      if (!accept) {
+        proposals.delete(proposalId);
+        io.to(from.socketId).emit("lobby:proposal:closed", { proposalId, reason: "declined" });
+        io.to(to.socketId).emit("lobby:proposal:closed", { proposalId, reason: "declined" });
+        broadcastLobbySnapshot();
+        return;
+      }
+
+      const room = createRoomWithDeck(proposal.deckCount);
+      proposals.delete(proposalId);
+
+      io.to(from.socketId).emit("lobby:match:ready", {
+        proposalId,
+        roomId: room.roomId,
+        inviteToken: room.inviteToken,
+        expiresAt: room.expiresAt,
+        joinPath: `/?room=${encodeURIComponent(room.roomId)}&token=${encodeURIComponent(room.inviteToken)}`
+      });
+      io.to(to.socketId).emit("lobby:match:ready", {
+        proposalId,
+        roomId: room.roomId,
+        inviteToken: room.inviteToken,
+        expiresAt: room.expiresAt,
+        joinPath: `/?room=${encodeURIComponent(room.roomId)}&token=${encodeURIComponent(room.inviteToken)}`
+      });
+
+      removeLobbyMember(from.memberId, "matched");
+      removeLobbyMember(to.memberId, "matched");
+    });
+
+    socket.on("disconnect", () => {
+      removeLobbyMember(memberId, "disconnected");
+    });
+
+    return;
+  }
+
   const room = getRoom(socket.data.roomId);
   if (!room) {
     socket.emit("room:expired", { roomId: socket.data.roomId });

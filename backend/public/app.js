@@ -10,10 +10,12 @@ const deckCountDown       = document.getElementById("deckCountDown");
 const deckCountUp         = document.getElementById("deckCountUp");
 const deckCountValEl      = document.getElementById("deckCountVal");
 const joinFromUrlBtn      = document.getElementById("joinFromUrl");
+const findPlayersBtn      = document.getElementById("findPlayers");
 
 /* DOM refs — table view */
 const tableViewEl   = document.getElementById("tableView");
 const landingViewEl = document.getElementById("landingView");
+const lobbyViewEl   = document.getElementById("lobbyView");
 const tableEl       = document.getElementById("table");
 const tRoomIdEl     = document.getElementById("tRoomId");
 const tExpiryEl     = document.getElementById("tExpiry");
@@ -26,6 +28,19 @@ const dealCountVal  = document.getElementById("dealCountVal");
 const passTurnBtn   = document.getElementById("passTurn");
 const copyLinkBtn   = document.getElementById("copyLink");
 const leaveBtn      = document.getElementById("leaveTable");
+
+/* DOM refs — global lobby */
+const leaveLobbyBtn       = document.getElementById("leaveLobby");
+const lobbyPlayersEl      = document.getElementById("lobbyPlayers");
+const lobbyStatusEl       = document.getElementById("lobbyStatus");
+const lobbySignalsEl      = document.getElementById("lobbySignals");
+const lobbyIncomingEl     = document.getElementById("lobbyIncoming");
+const lobbyIncomingTextEl = document.getElementById("lobbyIncomingText");
+const acceptProposalBtn   = document.getElementById("acceptProposal");
+const declineProposalBtn  = document.getElementById("declineProposal");
+const lobbyDeckDownBtn    = document.getElementById("lobbyDeckDown");
+const lobbyDeckUpBtn      = document.getElementById("lobbyDeckUp");
+const lobbyDeckValEl      = document.getElementById("lobbyDeckVal");
 
 /* State */
 let socket           = null;
@@ -40,6 +55,21 @@ let myPrivateCards   = new Map(); // cardId → real card data (only cards I hol
 let dealCount        = 5;         // cards per player for the next deal
 let deckCount        = 1;         // number of decks to use when creating a room
 let activeTurn       = null;      // memberId whose turn it is, or null
+let inLobby          = false;
+let lobbyPlayers     = [];
+let lobbySignal      = "ready";
+let lobbyDeckCount   = 1;
+let pendingProposal  = null;
+let lobbyHeartbeat   = null;
+
+const LOBBY_SIGNAL_LABELS = {
+  ready: "👍 Ready",
+  quick: "⚡ Quick",
+  casual: "🎲 Casual",
+  "1min": "⏳ 1 min",
+  brb: "☕ BRB",
+  pass: "🚫 Pass"
+};
 
 /* Deck pile — visual stack of face-down undealt cards near table centre */
 let PILE_CX          = 50;        // % — synced with server
@@ -141,16 +171,105 @@ function isRedSuit(suit)   { return RED_SUITS.has(suit); }
    View switching
 ────────────────────────────────────── */
 function showTableView() {
+  inLobby = false;
+  stopLobbyHeartbeat();
+  lobbyViewEl.classList.add("hidden");
   landingViewEl.classList.add("hidden");
   tableViewEl.classList.remove("hidden");
   document.body.style.overflow = "hidden";
 }
 
 function showLandingView() {
+  inLobby = false;
+  stopLobbyHeartbeat();
   tableViewEl.classList.add("hidden");
+  lobbyViewEl.classList.add("hidden");
   landingViewEl.classList.remove("hidden");
   document.body.style.overflow = "";
   stopExpiryCountdown();
+}
+
+function showLobbyView() {
+  inLobby = true;
+  pendingProposal = null;
+  tableViewEl.classList.add("hidden");
+  landingViewEl.classList.add("hidden");
+  lobbyViewEl.classList.remove("hidden");
+  document.body.style.overflow = "";
+  stopExpiryCountdown();
+}
+
+function stopLobbyHeartbeat() {
+  if (lobbyHeartbeat) {
+    clearInterval(lobbyHeartbeat);
+    lobbyHeartbeat = null;
+  }
+}
+
+function signalLabel(signal) {
+  return LOBBY_SIGNAL_LABELS[signal] || "Ready";
+}
+
+function renderLobbySignals() {
+  if (!lobbySignalsEl) { return; }
+  for (const chip of lobbySignalsEl.querySelectorAll(".lobby-chip")) {
+    chip.classList.toggle("active", chip.dataset.signal === lobbySignal);
+  }
+}
+
+function renderLobbyIncoming() {
+  if (!lobbyIncomingEl || !lobbyIncomingTextEl) { return; }
+  if (!pendingProposal || pendingProposal.direction !== "incoming") {
+    lobbyIncomingEl.classList.add("hidden");
+    return;
+  }
+  const from = lobbyPlayers.find((p) => p.memberId === pendingProposal.fromMemberId);
+  const deckLabel = pendingProposal.deckCount > 1 ? ` with ${pendingProposal.deckCount} decks` : "";
+  lobbyIncomingTextEl.textContent = `${from?.displayName || "Player"} wants to start a game${deckLabel}.`;
+  lobbyIncomingEl.classList.remove("hidden");
+}
+
+function renderLobbyPlayers() {
+  if (!lobbyPlayersEl) { return; }
+  lobbyPlayersEl.innerHTML = "";
+
+  const others = lobbyPlayers.filter((p) => p.memberId !== localMemberId);
+  if (others.length === 0) {
+    const item = document.createElement("li");
+    item.className = "lobby-empty";
+    item.textContent = "No other players yet.";
+    lobbyPlayersEl.appendChild(item);
+    return;
+  }
+
+  for (const player of others) {
+    const li = document.createElement("li");
+    li.className = "lobby-player";
+
+    const left = document.createElement("div");
+    left.className = "lobby-player-meta";
+    const strong = document.createElement("strong");
+    strong.textContent = player.displayName;
+    const signal = document.createElement("span");
+    signal.textContent = signalLabel(player.signal);
+    left.appendChild(strong);
+    left.appendChild(signal);
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "t-tool-btn";
+    btn.textContent = "Propose Match";
+    btn.disabled = !!pendingProposal;
+    btn.addEventListener("click", () => {
+      if (!socket) { return; }
+      socket.emit("lobby:propose", { targetMemberId: player.memberId, deckCount: lobbyDeckCount });
+      lobbyStatusEl.textContent = `Proposal sent to ${player.displayName}...`;
+    });
+
+    li.appendChild(left);
+    li.appendChild(btn);
+    lobbyPlayersEl.appendChild(li);
+  }
 }
 
 /* ──────────────────────────────────────
@@ -621,6 +740,102 @@ function connectRoom() {
   });
 }
 
+function connectGlobalLobby() {
+  if (socket) { socket.disconnect(); }
+  socket = io({
+    auth: {
+      mode: "lobby",
+      memberId: localMemberId,
+      playerToken: localPlayerToken,
+      displayName: localDisplayName || undefined
+    }
+  });
+
+  socket.on("connect", () => {
+    showLobbyView();
+    renderLobbySignals();
+    lobbyStatusEl.textContent = "Connected. Pick a signal and propose a match.";
+    stopLobbyHeartbeat();
+    lobbyHeartbeat = setInterval(() => {
+      if (socket && inLobby) { socket.emit("lobby:heartbeat"); }
+    }, 10_000);
+  });
+
+  socket.on("lobby:snapshot", ({ players, proposals }) => {
+    lobbyPlayers = Array.isArray(players) ? players : [];
+    const incoming = (proposals || []).find((p) => p.toMemberId === localMemberId);
+    const outgoing = (proposals || []).find((p) => p.fromMemberId === localMemberId);
+    pendingProposal = incoming
+      ? { direction: "incoming", proposalId: incoming.proposalId, fromMemberId: incoming.fromMemberId }
+      : outgoing
+        ? { direction: "outgoing", proposalId: outgoing.proposalId, toMemberId: outgoing.toMemberId }
+        : null;
+    if (!pendingProposal) {
+      lobbyStatusEl.textContent = "Waiting for players...";
+    }
+    renderLobbyIncoming();
+    renderLobbyPlayers();
+  });
+
+  socket.on("lobby:proposal:incoming", ({ proposalId, fromMemberId, deckCount }) => {
+    pendingProposal = { direction: "incoming", proposalId, fromMemberId, deckCount };
+    lobbyStatusEl.textContent = "Incoming match proposal.";
+    renderLobbyIncoming();
+    renderLobbyPlayers();
+  });
+
+  socket.on("lobby:proposal:outgoing", ({ proposalId, toMemberId }) => {
+    pendingProposal = { direction: "outgoing", proposalId, toMemberId };
+    const target = lobbyPlayers.find((p) => p.memberId === toMemberId);
+    lobbyStatusEl.textContent = `Waiting for ${target?.displayName || "player"} to respond...`;
+    renderLobbyIncoming();
+    renderLobbyPlayers();
+  });
+
+  socket.on("lobby:proposal:closed", ({ reason }) => {
+    pendingProposal = null;
+    lobbyStatusEl.textContent = reason === "declined"
+      ? "Proposal declined. You can try another player."
+      : "Proposal closed. Try again.";
+    renderLobbyIncoming();
+    renderLobbyPlayers();
+  });
+
+  socket.on("lobby:match:ready", async ({ roomId: nextRoomId, inviteToken: nextInviteToken }) => {
+    lobbyStatusEl.textContent = "Match accepted. Joining table...";
+    try {
+      await joinRoom(nextRoomId, nextInviteToken);
+      const url = new URL(window.location.href);
+      url.searchParams.set("room", nextRoomId);
+      url.searchParams.set("token", nextInviteToken);
+      window.history.replaceState({}, "", url);
+    } catch (_e) {
+      lobbyStatusEl.textContent = "Could not join generated room. Please retry.";
+    }
+  });
+
+  socket.on("lobby:error", ({ code }) => {
+    if (code === "proposal_rate_limited") {
+      lobbyStatusEl.textContent = "Slow down a bit before sending another proposal.";
+      return;
+    }
+    if (code === "player_busy") {
+      lobbyStatusEl.textContent = "That player is already considering another proposal.";
+      return;
+    }
+    if (code === "invalid_target") {
+      lobbyStatusEl.textContent = "That player is no longer available.";
+      return;
+    }
+    lobbyStatusEl.textContent = "Lobby action failed. Please try again.";
+  });
+
+  socket.on("connect_error", () => {
+    showLandingView();
+    setStatus("Could not connect to global lobby.", "error");
+  });
+}
+
 /* ──────────────────────────────────────
    Room join / create
 ────────────────────────────────────── */
@@ -715,6 +930,54 @@ joinFromUrlBtn?.addEventListener("click", async () => {
   } catch (_e) {
     // joinRoom already called setStatus with a specific message
   }
+});
+
+findPlayersBtn?.addEventListener("click", () => {
+  connectGlobalLobby();
+});
+
+lobbySignalsEl?.addEventListener("click", (event) => {
+  const target = event.target.closest(".lobby-chip");
+  if (!target || !socket) { return; }
+  lobbySignal = target.dataset.signal;
+  renderLobbySignals();
+  socket.emit("lobby:signal", { signal: lobbySignal });
+});
+
+acceptProposalBtn?.addEventListener("click", () => {
+  if (!socket || !pendingProposal || pendingProposal.direction !== "incoming") { return; }
+  socket.emit("lobby:proposal:respond", { proposalId: pendingProposal.proposalId, accept: true });
+  lobbyStatusEl.textContent = "Accepted. Creating room...";
+});
+
+declineProposalBtn?.addEventListener("click", () => {
+  if (!socket || !pendingProposal || pendingProposal.direction !== "incoming") { return; }
+  socket.emit("lobby:proposal:respond", { proposalId: pendingProposal.proposalId, accept: false });
+  pendingProposal = null;
+  renderLobbyIncoming();
+  renderLobbyPlayers();
+});
+
+lobbyDeckDownBtn?.addEventListener("click", () => {
+  lobbyDeckCount = Math.max(1, lobbyDeckCount - 1);
+  if (lobbyDeckValEl) { lobbyDeckValEl.textContent = String(lobbyDeckCount); }
+});
+
+lobbyDeckUpBtn?.addEventListener("click", () => {
+  lobbyDeckCount = Math.min(6, lobbyDeckCount + 1);
+  if (lobbyDeckValEl) { lobbyDeckValEl.textContent = String(lobbyDeckCount); }
+});
+
+leaveLobbyBtn?.addEventListener("click", () => {
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
+  inLobby = false;
+  pendingProposal = null;
+  lobbyPlayers = [];
+  stopLobbyHeartbeat();
+  showLandingView();
 });
 
 copyLinkBtn?.addEventListener("click", async () => {

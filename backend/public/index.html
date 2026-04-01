@@ -34,6 +34,7 @@
               <button id="deckCountUp" class="count-btn" aria-label="More decks">&#x2B;</button>
               <span class="count-label">deck</span>
             </div>
+            <button id="findPlayers" class="cta">Find Players</button>
             <button id="createRoom" class="cta">Create a Table</button>
             <button id="joinFromUrl" class="ghost">Join from URL</button>
           </div>
@@ -108,6 +109,57 @@
           <p class="power-kicker">Powered by</p>
           <p class="power-brand">Epheme</p>
           <p class="power-copy">A shared table that forgets you when you leave.</p>
+        </footer>
+      </main>
+    </div>
+
+    <!-- ═══════════════════════════════════════
+         GLOBAL LOBBY VIEW
+    ════════════════════════════════════════ -->
+    <div id="lobbyView" class="hidden">
+      <main class="lobby-shell">
+        <header class="lobby-head">
+          <h2>Global Lobby</h2>
+          <p>Find someone to play. No chat, only quick signals.</p>
+        </header>
+
+        <section class="lobby-controls">
+          <div class="lobby-signals" id="lobbySignals" aria-label="Quick signals">
+            <button type="button" class="lobby-chip" data-signal="ready">👍 Ready</button>
+            <button type="button" class="lobby-chip" data-signal="quick">⚡ Quick</button>
+            <button type="button" class="lobby-chip" data-signal="casual">🎲 Casual</button>
+            <button type="button" class="lobby-chip" data-signal="1min">⏳ 1 min</button>
+            <button type="button" class="lobby-chip" data-signal="brb">☕ BRB</button>
+            <button type="button" class="lobby-chip" data-signal="pass">🚫 Pass</button>
+          </div>
+          <div class="lobby-decks">
+            <span>Decks for match</span>
+            <button id="lobbyDeckDown" class="count-btn" aria-label="Fewer decks">&#x2212;</button>
+            <span id="lobbyDeckVal" class="count-val">1</span>
+            <button id="lobbyDeckUp" class="count-btn" aria-label="More decks">&#x2B;</button>
+          </div>
+        </section>
+
+        <section class="lobby-main">
+          <div class="lobby-list-wrap">
+            <h3>Players Online</h3>
+            <ul id="lobbyPlayers" class="lobby-list"></ul>
+          </div>
+          <aside class="lobby-side">
+            <h3>Match Status</h3>
+            <p id="lobbyStatus" class="lobby-status">Waiting for players...</p>
+            <div id="lobbyIncoming" class="lobby-incoming hidden">
+              <p id="lobbyIncomingText"></p>
+              <div class="lobby-incoming-actions">
+                <button id="acceptProposal" class="cta">Accept</button>
+                <button id="declineProposal" class="ghost">Decline</button>
+              </div>
+            </div>
+          </aside>
+        </section>
+
+        <footer class="lobby-foot">
+          <button id="leaveLobby" class="ghost">Back to Home</button>
         </footer>
       </main>
     </div>

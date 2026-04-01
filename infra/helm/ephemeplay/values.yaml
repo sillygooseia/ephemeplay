@@ -1,0 +1,52 @@
+nameOverride: ephemeplay
+fullnameOverride: ephemeplay
+
+image:
+  repository: silentcoil.sillygooseia.com:5000/ephemeplay/backend
+  tag: latest
+  pullPolicy: Always
+
+replicaCount: 1
+
+service:
+  port: 8787
+
+env:
+  PORT: "8787"
+  ROOM_TTL_MS: "7200000"
+  CREATE_ROOM_RATE_LIMIT: "10"
+  JOIN_ROOM_RATE_LIMIT: "30"
+
+# Sensitive values — never commit real values here.
+# Pass at deploy time via --set or a local values override.
+secrets:
+  playerJwtSecret: ""
+  redisPassword: ""
+
+resources:
+  requests:
+    cpu: "50m"
+    memory: "96Mi"
+  limits:
+    cpu: "250m"
+    memory: "256Mi"
+
+redis:
+  persistence:
+    enabled: true
+    size: 256Mi
+    storageClassName: "local-path"
+  resources:
+    requests:
+      cpu: "15m"
+      memory: "32Mi"
+    limits:
+      cpu: "75m"
+      memory: "64Mi"
+
+ingress:
+  enabled: true
+  className: traefik
+  host: play.epheme.org
+  tlsSecretName: play-epheme-org-tls
+  clusterIssuer: letsencrypt-prod

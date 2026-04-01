@@ -152,6 +152,7 @@ function pruneExpiredRooms() {
 
 setInterval(pruneExpiredRooms, CLEANUP_EVERY_MS);
 
+app.get("/healthz", (_req, res) => res.sendStatus(200));
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, rooms: rooms.size });
 });

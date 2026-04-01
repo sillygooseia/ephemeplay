@@ -9,3 +9,5 @@ dist/
 backend/.env
 backend/.env.*
 !backend/.env.example
+secrets/*.json
+!secrets/*.example.json

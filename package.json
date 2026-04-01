@@ -1,0 +1,11 @@
+{
+  "name": "ephemeplay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "EphemePlay umbrella app with EphemeDeck as the first game",
+  "scripts": {
+    "dev": "npm --prefix backend run dev",
+    "start": "npm --prefix backend run start",
+    "install:all": "npm --prefix backend install"
+  }
+}

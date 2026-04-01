@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EphemeDeck — Shared Card Table</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+
+    <!-- ═══════════════════════════════════════
+         LANDING VIEW
+    ════════════════════════════════════════ -->
+    <div id="landingView">
+      <main class="shell">
+        <section class="hero">
+          <p class="hero-kicker">EphemePlay presents</p>
+          <h1 class="brand">EphemeDeck</h1>
+          <p class="tagline">A no-login, no-rules, <strong>no-logic</strong> shared card table.</p>
+          <p class="support-copy">Play cards with friends. No accounts, no scoring, just a shared table.</p>
+          <div class="actions">
+            <button id="createRoom" class="cta">Create a Table</button>
+            <button id="joinFromUrl" class="ghost">Join from URL</button>
+          </div>
+          <p id="status" class="status"></p>
+        </section>
+
+        <section class="showcase" aria-hidden="true">
+          <div class="showcase-table">
+            <div class="show-card down" style="left: 11%; top: 24%; transform: rotate(-12deg);"></div>
+            <div class="show-card down" style="left: 13%; top: 28%; transform: rotate(-5deg);"></div>
+            <div class="show-card up red" style="left: 26%; top: 32%; transform: rotate(7deg);">
+              <span class="sc-tl">A<br/>♥</span><span class="sc-c">♥</span>
+            </div>
+            <div class="show-card up" style="left: 43%; top: 50%; transform: rotate(-4deg);">
+              <span class="sc-tl">8<br/>♣</span><span class="sc-c">♣</span>
+            </div>
+            <div class="show-card up red" style="left: 60%; top: 34%; transform: rotate(11deg);">
+              <span class="sc-tl">K<br/>♦</span><span class="sc-c">♦</span>
+            </div>
+            <div class="show-card down" style="left: 79%; top: 26%; transform: rotate(14deg);"></div>
+            <div class="show-card up red" style="left: 56%; top: 66%; transform: rotate(19deg);">
+              <span class="sc-tl">A<br/>♦</span><span class="sc-c">♦</span>
+            </div>
+            <div class="mist mist-1"></div>
+            <div class="mist mist-2"></div>
+          </div>
+        </section>
+
+        <section class="info-block">
+          <h2>How It Works</h2>
+          <div class="steps-grid">
+            <article class="step">
+              <div class="step-icon">01</div>
+              <h3>Create a table</h3>
+              <p>Get a room link instantly.</p>
+            </article>
+            <article class="step">
+              <div class="step-icon">02</div>
+              <h3>Share the link</h3>
+              <p>Invite friends and start in seconds.</p>
+            </article>
+            <article class="step">
+              <div class="step-icon">03</div>
+              <h3>Play your way</h3>
+              <p>Drag, deal, flip. No rules enforced.</p>
+            </article>
+            <article class="step">
+              <div class="step-icon">04</div>
+              <h3>Table disappears</h3>
+              <p>The room vanishes when it expires.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="info-block why-block">
+          <h2>Why EphemeDeck?</h2>
+          <ul class="why-list">
+            <li>No logins and no profiles.</li>
+            <li>No game logic and no scorekeeping.</li>
+            <li>No chat, no ads, no analytics.</li>
+            <li>Just a table to play on.</li>
+          </ul>
+        </section>
+
+        <section class="start-block">
+          <h2>Start a Table</h2>
+          <p>Jump in and start shuffling.</p>
+          <button id="createRoomSecondary" class="cta">Create a Table &#x2192;</button>
+        </section>
+
+        <footer class="powered-by">
+          <p class="power-kicker">Powered by</p>
+          <p class="power-brand">Epheme</p>
+          <p class="power-copy">A shared table that forgets you when you leave.</p>
+        </footer>
+      </main>
+    </div>
+
+    <!-- ═══════════════════════════════════════
+         TABLE VIEW  (full-screen, shown on join)
+    ════════════════════════════════════════ -->
+    <div id="tableView" class="hidden">
+
+      <!-- Top HUD bar -->
+      <header class="t-hud">
+        <div class="t-hud-brand">EphemeDeck</div>
+
+        <div class="t-hud-center">
+          <div class="t-seats" id="tSeats" aria-label="Players at table"></div>
+        </div>
+
+        <div class="t-hud-right">
+          <span class="t-expiry-label">expires</span>
+          <span class="t-expiry-value" id="tExpiry">—</span>
+          <button class="t-hud-btn" id="leaveTable" title="Leave table">&#x2715;</button>
+        </div>
+      </header>
+
+      <!-- Room background + oval table surface -->
+      <div class="t-room">
+
+        <!-- Seat position overlays (decorative edge seats) -->
+        <div class="t-seat-zone t-sz-top-left"  data-seat="4" aria-hidden="true"></div>
+        <div class="t-seat-zone t-sz-top"        data-seat="1" aria-hidden="true"></div>
+        <div class="t-seat-zone t-sz-top-right"  data-seat="5" aria-hidden="true"></div>
+        <div class="t-seat-zone t-sz-left"       data-seat="2" aria-hidden="true"></div>
+        <div class="t-seat-zone t-sz-right"      data-seat="3" aria-hidden="true"></div>
+        <div class="t-seat-zone t-sz-bottom"     data-seat="0" aria-hidden="true"></div>
+
+        <!-- The actual card surface -->
+        <div id="table" class="t-surface" aria-label="shared card table"></div>
+
+      </div>
+
+      <!-- Floating bottom toolbar -->
+      <nav class="t-toolbar" aria-label="Table controls">
+        <button id="shuffleDeck" class="t-tool-btn">&#x1F500; Shuffle</button>
+        <button id="dealCards"   class="t-tool-btn">&#x1F3B4; Deal</button>
+        <div class="t-tool-sep"></div>
+        <span class="t-room-id-label">Room</span>
+        <span class="t-room-id-val" id="tRoomId"></span>
+        <div class="t-tool-sep"></div>
+        <button id="copyLink" class="t-tool-btn t-tool-btn--outline">&#x1F517; Copy Invite</button>
+      </nav>
+
+      <!-- Card context menu (shown on right-click) -->
+      <menu id="cardMenu" class="card-menu" hidden>
+        <li><button id="cmTake"      class="cm-item">&#x1F91A; Take to hand</button></li>
+        <li><button id="cmRelease"   class="cm-item">&#x1F4E4; Release face-down</button></li>
+        <li><button id="cmReveal"    class="cm-item">&#x1F453; Reveal to table</button></li>
+        <li class="cm-sep" role="separator"></li>
+        <li><button id="cmFlip"      class="cm-item">&#x1F504; Flip</button></li>
+      </menu>
+
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

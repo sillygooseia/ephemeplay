@@ -1,0 +1,54 @@
+name: ephemeplay
+
+# EphemePlay local development with Redis
+#
+# Usage:
+#   docker compose up --build          # first run or after code changes
+#   docker compose up                  # subsequent runs (cached image)
+#   docker compose down                # stop and remove containers
+#   docker compose down -v             # also remove the redis volume
+#
+# App:   http://localhost:8787
+# Redis: localhost:6379  (exposed for local inspection with redis-cli)
+
+services:
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        NPM_TOKEN: "${NPM_TOKEN}"
+    image: ephemeplay-backend:local
+    container_name: ephemeplay-backend
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: "8787"
+      REDIS_URL: "redis://redis:6379"
+      ROOM_TTL_MS: "${ROOM_TTL_MS:-7200000}"
+      PLAYER_JWT_SECRET: "${PLAYER_JWT_SECRET}"
+      CREATE_ROOM_RATE_LIMIT: "${CREATE_ROOM_RATE_LIMIT:-10}"
+      JOIN_ROOM_RATE_LIMIT: "${JOIN_ROOM_RATE_LIMIT:-30}"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ephemeplay-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:

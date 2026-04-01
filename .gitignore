@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.angular/
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example

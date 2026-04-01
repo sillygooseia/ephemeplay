@@ -6,6 +6,9 @@
 const statusEl            = document.getElementById("status");
 const createRoomBtn       = document.getElementById("createRoom");
 const createRoomSecondary = document.getElementById("createRoomSecondary");
+const deckCountDown       = document.getElementById("deckCountDown");
+const deckCountUp         = document.getElementById("deckCountUp");
+const deckCountValEl      = document.getElementById("deckCountVal");
 const joinFromUrlBtn      = document.getElementById("joinFromUrl");
 
 /* DOM refs — table view */
@@ -17,6 +20,10 @@ const tExpiryEl     = document.getElementById("tExpiry");
 const tSeatsEl      = document.getElementById("tSeats");
 const shuffleBtn    = document.getElementById("shuffleDeck");
 const dealBtn       = document.getElementById("dealCards");
+const dealCountDown = document.getElementById("dealCountDown");
+const dealCountUp   = document.getElementById("dealCountUp");
+const dealCountVal  = document.getElementById("dealCountVal");
+const passTurnBtn   = document.getElementById("passTurn");
 const copyLinkBtn   = document.getElementById("copyLink");
 const leaveBtn      = document.getElementById("leaveTable");
 
@@ -30,14 +37,64 @@ let currentInviteLink = "";
 let expiryTimer      = null;
 let activeMembers    = [];
 let myPrivateCards   = new Map(); // cardId → real card data (only cards I hold)
+let dealCount        = 5;         // cards per player for the next deal
+let deckCount        = 1;         // number of decks to use when creating a room
+let activeTurn       = null;      // memberId whose turn it is, or null
+
+/* Deck pile — visual stack of face-down undealt cards near table centre */
+let PILE_CX          = 50;        // % — synced with server
+let PILE_CY          = 50;
+const PILE_THRESHOLD = 4;         // cards within 4% distance = part of pile
+const PILE_DROP_R    = 14;        // drop within 14% = snaps back to pile
+const dealInFlight   = new Set(); // card IDs currently animating from pile — exempt from isPileCard
+
+function isPileCard(card) {
+  return !dealInFlight.has(card.id) && !card.faceUp && !card.privateHolder &&
+    Math.hypot(card.x - PILE_CX, card.y - PILE_CY) < PILE_THRESHOLD;
+}
+
+function updatePileWidget() {
+  const pileEl = document.getElementById("deckPile");
+  if (!pileEl) { return; }
+  const count = Array.from(cardsById.values()).filter(isPileCard).length;
+  pileEl.hidden = count === 0;
+  const badge = pileEl.querySelector(".dp-count");
+  if (badge) { badge.textContent = String(count); }
+  // Keep widget visually centred on the pile position
+  pileEl.style.left = `${PILE_CX}%`;
+  pileEl.style.top  = `${PILE_CY}%`;
+}
 
 /* Player identity — stable across page refreshes via localStorage + server JWT */
-const PLAYER_ID_KEY    = "ephemedeck_player_id";
-const PLAYER_TOKEN_KEY = "ephemedeck_player_token";
+const PLAYER_ID_KEY      = "ephemedeck_player_id";
+const PLAYER_TOKEN_KEY   = "ephemedeck_player_token";
+const PLAYER_NAME_KEY    = "ephemedeck_display_name";
 
-let localMemberId  = localStorage.getItem(PLAYER_ID_KEY)
-                     || `anon-${Math.random().toString(16).slice(2, 8)}`;
+let localMemberId    = localStorage.getItem(PLAYER_ID_KEY)
+                       || `anon-${Math.random().toString(16).slice(2, 8)}`;
 let localPlayerToken = localStorage.getItem(PLAYER_TOKEN_KEY) || null;
+let localDisplayName = localStorage.getItem(PLAYER_NAME_KEY) || "";
+
+// Wire name input
+const playerNameInput = document.getElementById("playerName");
+const nameSavedEl    = document.getElementById("nameSaved");
+let nameSavedTimer   = null;
+if (playerNameInput) {
+  playerNameInput.value = localDisplayName;
+  playerNameInput.addEventListener("input", () => {
+    localDisplayName = playerNameInput.value.trim().slice(0, 20);
+    localStorage.setItem(PLAYER_NAME_KEY, localDisplayName);
+    if (nameSavedEl) {
+      nameSavedEl.textContent = localDisplayName ? "\u2713 Saved" : "";
+      nameSavedEl.classList.add("visible");
+      clearTimeout(nameSavedTimer);
+      nameSavedTimer = setTimeout(() => { nameSavedEl.classList.remove("visible"); }, 1800);
+    }
+  });
+}
+
+/* memberId → display name, populated from room:presence */
+let memberNames = new Map();
 
 /**
  * Fetch (or refresh) a player identity JWT from the server.
@@ -159,11 +216,14 @@ function renderSeats(members) {
     pip.style.background = SEAT_COLORS[i];
 
     const occupant = members[i];
+    const isActive = occupant && occupant === activeTurn;
+    if (isActive) { pip.classList.add("active-turn"); }
     if (occupant) {
       pip.classList.add("active");
       const isYou = occupant === localMemberId;
-      pip.title = isYou ? "You" : `Player ${i + 1}`;
-      pip.textContent = isYou ? "YOU" : String(i + 1);
+      const label = isYou ? (localDisplayName || "You") : (memberNames.get(occupant) || `P${i + 1}`);
+      pip.title = isYou ? (localDisplayName || "You") : label;
+      pip.textContent = label.slice(0, 4);
     } else {
       pip.title = `Seat ${i + 1} — empty`;
       pip.textContent = String(i + 1);
@@ -177,9 +237,12 @@ function renderSeats(members) {
     const zone = document.querySelector(`.${cls}`);
     if (!zone) { return; }
     const occupant = members[i];
+    const isActive = occupant && occupant === activeTurn;
+    zone.classList.toggle("active-turn", !!isActive);
     if (occupant) {
       const isYou = occupant === localMemberId;
-      zone.dataset.label  = isYou ? "▶ You" : `Player ${i + 1}`;
+      const name  = isYou ? (localDisplayName || "You") : (memberNames.get(occupant) || `Player ${i + 1}`);
+      zone.dataset.label  = isYou ? `\u25B6 ${name}` : name;
       zone.classList.add("occupied");
       zone.classList.remove("empty");
     } else {
@@ -199,9 +262,35 @@ function renderSeats(members) {
  * "You" for the local player, "Player N" (1-based seat) for others.
  */
 function getPlayerLabel(memberId) {
-  if (memberId === localMemberId) { return "You"; }
+  if (memberId === localMemberId) {
+    return localDisplayName || "You";
+  }
+  const name = memberNames.get(memberId);
+  if (name) { return name; }
   const idx = activeMembers.indexOf(memberId);
   return idx >= 0 ? `P${idx + 1}` : "?";
+}
+
+/* Apply/remove active-turn glow on the seat zone surface elements */
+function applyTurnHighlight() {
+  const SEAT_SLOT_ATTRS = ["t-sz-bottom","t-sz-top","t-sz-left","t-sz-right","t-sz-top-left","t-sz-top-right"];
+  const isMyTurn = activeTurn && activeTurn === localMemberId;
+  if (passTurnBtn) {
+    const multiPlayer = activeMembers.filter(Boolean).length > 1;
+    const turnGroup = document.getElementById("turnGroup");
+    if (turnGroup) turnGroup.hidden = !multiPlayer;
+    passTurnBtn.disabled = !multiPlayer;
+    passTurnBtn.title = activeTurn ? "Pass turn to next player (double-click to stop)" : "Start turn tracking";
+    passTurnBtn.classList.toggle("t-tool-btn--turn-active", !!activeTurn);
+  }
+  SEAT_SLOT_ATTRS.forEach((cls, i) => {
+    const zone = document.querySelector(`.${cls}`);
+    if (!zone) { return; }
+    zone.classList.toggle("active-turn", activeMembers[i] === activeTurn && !!activeTurn);
+  });
+  // Flash the whole table edge if it's your turn
+  const tableWrap = document.querySelector(".t-room");
+  if (tableWrap) { tableWrap.classList.toggle("your-turn", !!isMyTurn); }
 }
 function buildCardFace(card) {
   const sym    = suitSymbol(card.suit);
@@ -245,12 +334,15 @@ function upsertCardElement(card) {
     });
 
     let ptrOffX = 0, ptrOffY = 0;
+    let ptrStartX = 0, ptrStartY = 0;
 
     el.addEventListener("pointerdown", (e) => {
       el.setPointerCapture(e.pointerId);
       const r  = tableEl.getBoundingClientRect();
       ptrOffX  = (e.clientX - r.left) / r.width  * 100 - (parseFloat(el.style.left)  || card.x);
       ptrOffY  = (e.clientY - r.top)  / r.height * 100 - (parseFloat(el.style.top)   || card.y);
+      ptrStartX = e.clientX;
+      ptrStartY = e.clientY;
       el.dataset.dragging = "true";
       el.style.transition = "box-shadow 100ms"; // suppress position glide during drag
     });
@@ -269,9 +361,21 @@ function upsertCardElement(card) {
       el.releasePointerCapture(e.pointerId);
       el.dataset.dragging = "false";
       el.style.transition = ""; // restore CSS transition for animated moves
+      // Only broadcast a move if the pointer actually travelled (not a plain click)
+      const dx = e.clientX - ptrStartX;
+      const dy = e.clientY - ptrStartY;
+      if (dx * dx + dy * dy < 25) { return; } // < 5px — treat as click, not drag
       const r = tableEl.getBoundingClientRect();
       const x = ((e.clientX - r.left) / r.width)  * 100;
       const y = ((e.clientY - r.top)  / r.height) * 100;
+      // If dropped near the pile centre, snap back into the pile
+      if (!card.privateHolder && Math.hypot(x - PILE_CX, y - PILE_CY) < PILE_DROP_R) {
+        const pileCount = Array.from(cardsById.values()).filter(isPileCard).length;
+        const px = PILE_CX + (pileCount % 8) * 0.15;
+        const py = PILE_CY + (pileCount % 8) * 0.15;
+        if (socket) { socket.emit("card:move", { id: card.id, x: px, y: py }); }
+        return;
+      }
       if (socket) { socket.emit("card:move", { id: card.id, x, y }); }
     });
 
@@ -311,6 +415,11 @@ function upsertCardElement(card) {
   el.style.left    = `${card.x}%`;
   el.style.top     = `${card.y}%`;
   el.style.zIndex  = String(card.z || 1);
+
+  // Visually hide cards that are part of the pile — the pile widget covers them
+  const inPile = isPileCard(card);
+  el.style.visibility  = inPile ? "hidden" : "";
+  el.style.pointerEvents = inPile ? "none" : "";
 }
 
 function renderSnapshot(snapshot) {
@@ -326,10 +435,12 @@ function renderSnapshot(snapshot) {
 
   const knownIds = new Set(snapshot.cards.map((c) => c.id));
   Array.from(tableEl.children).forEach((child) => {
+    if (child.id === "deckPile") { return; } // keep pile widget
     if (!knownIds.has(child.id)) { child.remove(); }
   });
 
   snapshot.cards.forEach(upsertCardElement);
+  updatePileWidget();
 
   if (snapshot.expiresAt) {
     startExpiryCountdown(snapshot.expiresAt);
@@ -413,7 +524,7 @@ function connectRoom() {
   if (socket) { socket.disconnect(); }
 
   socket = io({
-    auth: { roomId, token: inviteToken, memberId: localMemberId, playerToken: localPlayerToken }
+    auth: { roomId, token: inviteToken, memberId: localMemberId, playerToken: localPlayerToken, displayName: localDisplayName || undefined }
   });
 
   socket.on("connect", () => {
@@ -421,12 +532,62 @@ function connectRoom() {
     showTableView();
   });
 
+  socket.on("card:deal-flight", ({ card, deckX, deckY }) => {
+    // Mark card as in-flight so isPileCard doesn't hide it at the pile origin
+    dealInFlight.add(card.id);
+    cardsById.set(card.id, card);
+    upsertCardElement({ ...card, x: deckX, y: deckY });
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        cardsById.set(card.id, card);
+        upsertCardElement(card);
+        dealInFlight.delete(card.id);
+        updatePileWidget();
+      });
+    });
+  });
+
+  socket.on("pile:moved", ({ x, y }) => {
+    const dx = x - PILE_CX;
+    const dy = y - PILE_CY;
+    PILE_CX = x;
+    PILE_CY = y;
+    // Apply delta to all pile cards in local state AND in the DOM
+    for (const card of cardsById.values()) {
+      if (!card.faceUp && !card.privateHolder) {
+        card.x += dx;
+        card.y += dy;
+        // Update DOM position so the deal animation starts from the right place
+        const el = document.getElementById(card.id);
+        if (el) {
+          el.style.transition = "none"; // instant reposition, no slide
+          el.style.left = `${card.x}%`;
+          el.style.top  = `${card.y}%`;
+          // Re-enable transition on next frame
+          requestAnimationFrame(() => { el.style.transition = ""; });
+        }
+      }
+    }
+    updatePileWidget();
+  });
+
+  socket.on("turn:update", ({ activeTurn: t }) => {
+    activeTurn = t || null;
+    applyTurnHighlight();
+    renderSeats(activeMembers);
+  });
+
   socket.on("room:snapshot", (snapshot) => {
+    if (snapshot.activeTurn !== undefined) { activeTurn = snapshot.activeTurn; }
+    if (snapshot.pileX !== undefined) { PILE_CX = snapshot.pileX; }
+    if (snapshot.pileY !== undefined) { PILE_CY = snapshot.pileY; }
+    if (snapshot.names) { memberNames = new Map(Object.entries(snapshot.names)); }
     renderSnapshot(snapshot);
     if (snapshot.members) { renderSeats(snapshot.members); }
   });
 
-  socket.on("room:presence", ({ members }) => {
+  socket.on("room:presence", ({ members, names }) => {
+    if (names) { memberNames = new Map(Object.entries(names)); }
     renderSeats(members);
   });
 
@@ -437,6 +598,7 @@ function connectRoom() {
     }
     cardsById.set(card.id, card);
     upsertCardElement(card);
+    updatePileWidget();
   });
 
   socket.on("card:private", ({ card }) => {
@@ -444,6 +606,7 @@ function connectRoom() {
     myPrivateCards.set(card.id, card);
     cardsById.set(card.id, card);
     upsertCardElement(card);
+    updatePileWidget();
   });
 
   socket.on("room:expired", () => {
@@ -498,7 +661,11 @@ async function createRoom() {
   setStatus("Creating table…");
 
   try {
-    const res     = await fetch("/api/rooms", { method: "POST" });
+    const res     = await fetch("/api/rooms", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deckCount }),
+    });
     const payload = await res.json();
 
     await joinRoom(payload.roomId, payload.inviteToken);
@@ -526,7 +693,14 @@ function setStatus(text, type = "info") {
 ────────────────────────────────────── */
 createRoomBtn?.addEventListener("click", createRoom);
 createRoomSecondary?.addEventListener("click", createRoom);
-
+deckCountDown?.addEventListener("click", () => {
+  deckCount = Math.max(1, deckCount - 1);
+  if (deckCountValEl) { deckCountValEl.textContent = deckCount; }
+});
+deckCountUp?.addEventListener("click", () => {
+  deckCount = Math.min(6, deckCount + 1);
+  if (deckCountValEl) { deckCountValEl.textContent = deckCount; }
+});
 joinFromUrlBtn?.addEventListener("click", async () => {
   const p = new URLSearchParams(window.location.search);
   const r = p.get("room");
@@ -560,9 +734,108 @@ shuffleBtn?.addEventListener("click", () => {
 });
 
 dealBtn?.addEventListener("click", () => {
-  /* Deal 5 cards to up to however many members are at the table (max 6) */
   const players = Math.max(1, Math.min(6, activeMembers.length || 1));
-  if (socket) { socket.emit("deck:deal", { players, count: 5 }); }
+  if (socket) {
+    dealBtn.disabled = true;
+    const totalCards  = players * dealCount;
+    const animMs      = totalCards * 80 + 500; // matches server stagger + one extra card
+    socket.emit("deck:deal", { players, count: dealCount });
+    setTimeout(() => { dealBtn.disabled = false; }, animMs);
+  }
+});
+
+dealCountDown?.addEventListener("click", () => {
+  dealCount = Math.max(1, dealCount - 1);
+  if (dealCountVal) { dealCountVal.textContent = dealCount; }
+});
+dealCountUp?.addEventListener("click", () => {
+  dealCount = Math.min(13, dealCount + 1);
+  if (dealCountVal) { dealCountVal.textContent = dealCount; }
+});
+
+/* Pile click — draw the top card out to just below the pile */
+let pileJustDragged = false;
+document.getElementById("deckPile")?.addEventListener("click", () => {
+  if (pileJustDragged) { pileJustDragged = false; return; }
+  if (!socket) { return; }
+  const pileCards = Array.from(cardsById.values()).filter(isPileCard);
+  if (pileCards.length === 0) { return; }
+  const topCard = pileCards.reduce((a, b) => (a.z > b.z ? a : b));
+  socket.emit("card:move", { id: topCard.id, x: PILE_CX, y: PILE_CY + 20 });
+});
+
+/* Pile drag — move the whole pile */
+(function wirePileDrag() {
+  const pileEl = document.getElementById("deckPile");
+  if (!pileEl) { return; }
+  let dragging = false;
+  let didDrag  = false;
+  let startPx, startPy, startCX, startCY;
+
+  pileEl.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) { return; }
+    dragging  = true;
+    didDrag   = false;
+    startPx   = e.clientX;
+    startPy   = e.clientY;
+    startCX   = PILE_CX;
+    startCY   = PILE_CY;
+    pileEl.setPointerCapture(e.pointerId);
+    e.stopPropagation();
+  });
+
+  pileEl.addEventListener("pointermove", (e) => {
+    if (!dragging) { return; }
+    const r  = tableEl.getBoundingClientRect();
+    const dx = (e.clientX - startPx) / r.width  * 100;
+    const dy = (e.clientY - startPy) / r.height * 100;
+    if (dx * dx + dy * dy > 0.25) { didDrag = true; } // > ~0.5% movement
+    const nx = Math.max(5, Math.min(95, startCX + dx));
+    const ny = Math.max(5, Math.min(95, startCY + dy));
+    pileEl.style.left = `${nx}%`;
+    pileEl.style.top  = `${ny}%`;
+  });
+
+  pileEl.addEventListener("pointerup", (e) => {
+    if (!dragging) { return; }
+    dragging = false;
+    pileEl.releasePointerCapture(e.pointerId);
+    const dx = e.clientX - startPx;
+    const dy = e.clientY - startPy;
+    if (dx * dx + dy * dy < 25) { didDrag = false; return; } // treat as click
+    pileJustDragged = true;
+    const r2 = tableEl.getBoundingClientRect();
+    const nx = Math.max(5, Math.min(95, startCX + (e.clientX - startPx) / r2.width  * 100));
+    const ny = Math.max(5, Math.min(95, startCY + (e.clientY - startPy) / r2.height * 100));
+    if (socket) { socket.emit("pile:move", { x: nx, y: ny }); }
+  });
+
+  // Suppress the click event that the browser fires after a drag pointerup
+  pileEl.addEventListener("click", (e) => {
+    if (didDrag) {
+      didDrag = false;
+      e._pileDragSuppressed = true;
+      e.stopImmediatePropagation();
+    }
+  });
+}());
+
+/* Pass Turn — click to advance, click again when it's your turn to pass,
+   or double-click to stop turn tracking entirely */
+let passTurnClickTimer = null;
+passTurnBtn?.addEventListener("click", () => {
+  if (!socket) { return; }
+  // Double-click within 350ms = clear turn tracking
+  if (passTurnClickTimer) {
+    clearTimeout(passTurnClickTimer);
+    passTurnClickTimer = null;
+    socket.emit("turn:clear");
+    return;
+  }
+  passTurnClickTimer = setTimeout(() => {
+    passTurnClickTimer = null;
+    socket.emit("turn:pass");
+  }, 350);
 });
 
 leaveBtn?.addEventListener("click", () => {

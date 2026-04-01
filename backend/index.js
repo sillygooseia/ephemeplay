@@ -61,26 +61,29 @@ const playerRegistry = PLAYER_JWT_SECRET
 
 const rooms = new Map();
 
-function createDeck(roomId) {
+function createDeck(roomId, deckCount = 1) {
   const suits = ["spades", "hearts", "diamonds", "clubs"];
   const ranks = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
   const deck = [];
 
   let offset = 0;
-  for (const suit of suits) {
-    for (const rank of ranks) {
-      deck.push({
-        id: `${roomId}-${suit}-${rank}`,
-        suit,
-        rank,
-        faceUp: false,
-        x: 40 + (offset % 10) * 0.8,
-        y: 40 + (offset % 10) * 0.8,
-        z: offset,
-        holder: "table",
-        privateHolder: null
-      });
-      offset += 1;
+  for (let d = 0; d < deckCount; d += 1) {
+    const suffix = deckCount > 1 ? `-d${d}` : "";
+    for (const suit of suits) {
+      for (const rank of ranks) {
+        deck.push({
+          id: `${roomId}-${suit}-${rank}${suffix}`,
+          suit,
+          rank,
+          faceUp: false,
+          x: 49.5 + (offset % 8) * 0.15,
+          y: 49.5 + (offset % 8) * 0.15,
+          z: offset,
+          holder: "table",
+          privateHolder: null
+        });
+        offset += 1;
+      }
     }
   }
 
@@ -105,6 +108,10 @@ function serializeRoom(room) {
     roomId: room.roomId,
     expiresAt: room.expiresAt,
     revision: room.revision,
+    activeTurn: room.activeTurn || null,
+    pileX: room.pileX,
+    pileY: room.pileY,
+    names: Object.fromEntries(room.memberNames),
     // Mask privately held cards for public broadcast: everyone sees the back
     cards: room.cards.map((c) =>
       c.privateHolder ? { ...c, faceUp: false } : c
@@ -180,10 +187,11 @@ app.post("/api/identity", (req, res) => {
   return res.json({ playerId: id, token, anonymous: false });
 });
 
-app.post("/api/rooms", createRoomLimiter, (_req, res) => {
-  const roomId = roomIdGen();
+app.post("/api/rooms", createRoomLimiter, (req, res) => {
+  const deckCount   = Math.max(1, Math.min(6, Number((req.body || {}).deckCount) || 1));
+  const roomId      = roomIdGen();
   const inviteToken = tokenGen();
-  const createdAt = now();
+  const createdAt   = now();
 
   const room = {
     roomId,
@@ -192,7 +200,12 @@ app.post("/api/rooms", createRoomLimiter, (_req, res) => {
     lastActiveAt: createdAt,
     expiresAt: createdAt + ROOM_TTL_MS,
     revision: 1,
-    cards: createDeck(roomId),
+    cards: createDeck(roomId, deckCount),
+    dealCursor: 0,
+    pileX: 50,          // % — pile centre, updated by pile:move
+    pileY: 50,
+    activeTurn: null,   // memberId whose turn it is, or null
+    memberNames: new Map(), // memberId → display name (no turn tracking)
     members: new Set(),
     memberSockets: new Map()
   };
@@ -225,7 +238,7 @@ app.post("/api/rooms/:roomId/join", joinRoomLimiter, joinPenalty, (req, res) => 
 app.use(express.static(path.join(__dirname, "public")));
 
 io.use((socket, next) => {
-  const { roomId, token, memberId, playerToken } = socket.handshake.auth || {};
+  const { roomId, token, memberId, playerToken, displayName } = socket.handshake.auth || {};
   const room = getRoom(roomId);
 
   if (!assertRoomToken(room, token)) {
@@ -247,6 +260,9 @@ io.use((socket, next) => {
   } else {
     socket.data.memberId = memberId || `anon-${Math.random().toString(16).slice(2, 8)}`;
   }
+  // Store display name from handshake (sanitised, max 20 chars)
+  const rawName = String(displayName || "").trim().slice(0, 20);
+  socket.data.displayName = rawName || null;
 
   return next();
 });
@@ -262,11 +278,17 @@ io.on("connection", (socket) => {
   touchRoom(room);
   room.members.add(socket.data.memberId);
   room.memberSockets.set(socket.data.memberId, socket.id);
+  if (socket.data.displayName) {
+    room.memberNames.set(socket.data.memberId, socket.data.displayName);
+  }
   socket.join(roomChannel(room.roomId));
 
   socket.emit("room:snapshot", serializeRoom(room));
   sendPrivatePatches(room, socket.data.memberId);
-  io.to(roomChannel(room.roomId)).emit("room:presence", { members: Array.from(room.members) });
+  io.to(roomChannel(room.roomId)).emit("room:presence", {
+    members: Array.from(room.members),
+    names: Object.fromEntries(room.memberNames)
+  });
 
   socket.on("card:move", ({ id, x, y }) => {
     const activeRoom = getRoom(socket.data.roomId);
@@ -415,9 +437,13 @@ io.on("connection", (socket) => {
     }
 
     activeRoom.revision += 1;
+    activeRoom.dealCursor = 0;
+    activeRoom.activeTurn = null;
+    activeRoom.pileX = 50;
+    activeRoom.pileY = 50;
     cards.forEach((card, index) => {
-      card.x = 40 + (index % 8) * 0.7;
-      card.y = 40 + (index % 8) * 0.7;
+      card.x = 49.5 + (index % 8) * 0.15;
+      card.y = 49.5 + (index % 8) * 0.15;
       card.z = activeRoom.revision + index;
       card.faceUp = false;
     });
@@ -428,53 +454,126 @@ io.on("connection", (socket) => {
 
   socket.on("deck:deal", ({ players = 4, count = 5 }) => {
     const activeRoom = getRoom(socket.data.roomId);
-    if (!activeRoom) {
-      return;
-    }
+    if (!activeRoom) { return; }
 
-const safePlayers = Math.max(1, Math.min(6, Number(players) || 2));
-    const safeCount = Math.max(1, Math.min(13, Number(count) || 5));
+    const safePlayers = Math.max(1, Math.min(6, Number(players) || 2));
+    const safeCount   = Math.max(1, Math.min(13, Number(count) || 5));
 
     touchRoom(activeRoom);
-    activeRoom.revision += 1;
 
-    // Seat anchor positions as [x%, y%] on the oval surface.
-    // Matches the 6 seat zones: bottom, top, left, right, top-left, top-right.
     const SEAT_ANCHORS = [
-      [50, 80],  // seat 0 — bottom  (You)
-      [50, 15],  // seat 1 — top
-      [12, 50],  // seat 2 — left
-      [88, 50],  // seat 3 — right
-      [22, 22],  // seat 4 — top-left
-      [78, 22],  // seat 5 — top-right
+      [50, 80], [50, 15], [12, 50], [88, 50], [22, 22], [78, 22],
     ];
+    const CARD_SPREAD     = 7;
+    const HORIZONTAL_SEATS = new Set([0, 1, 4, 5]);
 
-    // Fan cards horizontally around each anchor; alternate fan direction
-    // for left/right seats so hands read naturally from each position.
-    const CARD_SPREAD = 7;   // % spacing between fanned cards
-    const HORIZONTAL_SEATS = new Set([0, 1, 4, 5]); // fan left-right
-    // seats 2 (left) and 3 (right) fan vertically instead
+    // Deck origin — where cards appear to fly from (tracks movable pile)
+    const DECK_X = activeRoom.pileX;
+    const DECK_Y = activeRoom.pileY;
 
-    let cursor = 0;
-    for (let p = 0; p < safePlayers; p += 1) {
-      const [ax, ay] = SEAT_ANCHORS[p % SEAT_ANCHORS.length];
-      const fanHorizontal = HORIZONTAL_SEATS.has(p);
-      const halfSpan = ((safeCount - 1) * CARD_SPREAD) / 2;
+    // Build the deal sequence in round-robin order (player 0 card 0, player 1 card 0, …)
+    // so animation feels like real dealing around the table.
+    const flights = [];
+    const playerCards = Array.from({ length: safePlayers }, () => []);
 
-      for (let c = 0; c < safeCount; c += 1) {
-        const card = activeRoom.cards[cursor];
+    for (let c = 0; c < safeCount; c += 1) {
+      for (let p = 0; p < safePlayers; p += 1) {
+        const card = activeRoom.cards[activeRoom.dealCursor];
         if (!card) { break; }
 
-        const offset = c * CARD_SPREAD - halfSpan;
-        card.x = fanHorizontal ? ax + offset : ax;
-        card.y = fanHorizontal ? ay          : ay + offset;
-        card.z = activeRoom.revision + cursor;
-        card.faceUp = false;
-        cursor += 1;
+        const [ax, ay]    = SEAT_ANCHORS[p % SEAT_ANCHORS.length];
+        const fanH        = HORIZONTAL_SEATS.has(p);
+        // We compute the final fan position once we know how many cards this player ends up with.
+        playerCards[p].push({ card, c });
+        activeRoom.dealCursor += 1;
       }
     }
 
-    io.to(roomChannel(activeRoom.roomId)).emit("room:snapshot", serializeRoom(activeRoom));
+    // Flatten into round-robin order, computing final positions now that counts are known
+    let globalIdx = 0;
+    for (let c = 0; c < safeCount; c += 1) {
+      for (let p = 0; p < safePlayers; p += 1) {
+        const entry = playerCards[p][c];
+        if (!entry) { continue; }
+        const { card } = entry;
+        const [ax, ay] = SEAT_ANCHORS[p % SEAT_ANCHORS.length];
+        const fanH     = HORIZONTAL_SEATS.has(p);
+        const n        = playerCards[p].length;
+        const halfSpan = ((n - 1) * CARD_SPREAD) / 2;
+        const offset   = c * CARD_SPREAD - halfSpan;
+
+        activeRoom.revision += 1;
+        card.x      = fanH ? ax + offset : ax;
+        card.y      = fanH ? ay          : ay + offset;
+        card.z      = activeRoom.revision;
+        card.faceUp = false;
+
+        flights.push({ card: { ...card }, deckX: DECK_X, deckY: DECK_Y, delay: globalIdx * 80 });
+        globalIdx += 1;
+      }
+    }
+
+    // Stagger individual card flight events; each client animates from deck → seat
+    const channel = roomChannel(activeRoom.roomId);
+    for (const flight of flights) {
+      setTimeout(() => {
+        io.to(channel).emit("card:deal-flight", {
+          card:  flight.card,
+          deckX: flight.deckX,
+          deckY: flight.deckY,
+        });
+      }, flight.delay);
+    }
+
+    recordHit();
+  });
+
+  // ── Pile move ──
+  socket.on("pile:move", ({ x, y }) => {
+    const activeRoom = getRoom(socket.data.roomId);
+    if (!activeRoom) { return; }
+    const nx = Number.isFinite(x) ? Math.max(5, Math.min(95, x)) : activeRoom.pileX;
+    const ny = Number.isFinite(y) ? Math.max(5, Math.min(95, y)) : activeRoom.pileY;
+    const dx = nx - activeRoom.pileX;
+    const dy = ny - activeRoom.pileY;
+    activeRoom.pileX = nx;
+    activeRoom.pileY = ny;
+    touchRoom(activeRoom);
+    activeRoom.revision += 1;
+    // Batch-move all pile cards (face-down, unowned, close to old centre)
+    const PILE_THRESHOLD = 6;
+    activeRoom.cards.forEach((card) => {
+      if (!card.faceUp && !card.privateHolder) {
+        card.x = Math.max(2, Math.min(98, card.x + dx));
+        card.y = Math.max(2, Math.min(98, card.y + dy));
+        card.z = activeRoom.revision;
+      }
+    });
+    io.to(roomChannel(activeRoom.roomId)).emit("pile:moved", { x: nx, y: ny });
+  });
+
+  // ── Turn tracking (social cue only — no enforcement) ──
+  socket.on("turn:pass", () => {
+    const activeRoom = getRoom(socket.data.roomId);
+    if (!activeRoom) { return; }
+    touchRoom(activeRoom);
+    const members = Array.from(activeRoom.members);
+    if (members.length === 0) { return; }
+    // If no active turn yet, start with the member after the caller
+    const currentIdx = activeRoom.activeTurn
+      ? members.indexOf(activeRoom.activeTurn)
+      : members.indexOf(socket.data.memberId);
+    const nextIdx = (currentIdx + 1) % members.length;
+    activeRoom.activeTurn = members[nextIdx];
+    io.to(roomChannel(activeRoom.roomId)).emit("turn:update", { activeTurn: activeRoom.activeTurn });
+  });
+
+  socket.on("turn:clear", () => {
+    const activeRoom = getRoom(socket.data.roomId);
+    if (!activeRoom) { return; }
+    touchRoom(activeRoom);
+    activeRoom.activeTurn = null;
+    io.to(roomChannel(activeRoom.roomId)).emit("turn:update", { activeTurn: null });
   });
 
   socket.on("disconnect", () => {
@@ -485,6 +584,7 @@ const safePlayers = Math.max(1, Math.min(6, Number(players) || 2));
 
     activeRoom.members.delete(socket.data.memberId);
     activeRoom.memberSockets.delete(socket.data.memberId);
+    activeRoom.memberNames.delete(socket.data.memberId);
 
     // Release all privately held cards back to the table
     let released = false;
@@ -499,7 +599,10 @@ const safePlayers = Math.max(1, Math.min(6, Number(players) || 2));
       }
     });
 
-    io.to(roomChannel(activeRoom.roomId)).emit("room:presence", { members: Array.from(activeRoom.members) });
+    io.to(roomChannel(activeRoom.roomId)).emit("room:presence", {
+      members: Array.from(activeRoom.members),
+      names: Object.fromEntries(activeRoom.memberNames)
+    });
   });
 });
 
